@@ -60,6 +60,8 @@ python3 anyshare_cli.py --link "https://yunpan.ustb.edu.cn/link/AA..." \
 可选参数：
 - `--name` 远端文件名覆盖
 - `--ondup` 文件重名处理策略（默认 1）
+- `--timeout` 传输超时秒数（默认 3600，传 0 关闭超时）
+- `--no-progress` 关闭上传进度条
 
 ## 下载文件
 
@@ -88,12 +90,14 @@ python3 anyshare_cli.py --link "https://yunpan.ustb.edu.cn/link/AA..." \
 - `--out` 输出文件或目录
 - `--overwrite` 覆盖已有文件
 - `--authtype` 下载鉴权类型（默认 "1"，如失败可尝试其他值）
+- `--timeout` 传输超时秒数（默认 3600，传 0 关闭超时）
 
 ## 常见问题
 
 - 链接带密码：当前脚本不支持密码分享。
 - 返回 401/403：分享链接可能过期、权限变化或鉴权类型不匹配。
 - 文件重名冲突：可调整 `--ondup` 的值。
+- 上传超时：可提高 `--timeout` 或临时设置为 0 关闭超时。
 
 ## 安全提示
 

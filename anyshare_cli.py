@@ -12,7 +12,9 @@ except Exception:
     print("This script requires the 'requests' package. Install with: python3 -m pip install requests")
     sys.exit(1)
 
-DEFAULT_TIMEOUT = 30
+DEFAULT_API_TIMEOUT = 30
+DEFAULT_CONNECT_TIMEOUT = 10
+DEFAULT_TRANSFER_TIMEOUT = 3600
 
 
 class AnyshareError(RuntimeError):
@@ -44,12 +46,12 @@ def get_link_token(session, link_id):
 
 
 def ensure_link_token(session, link_url, base_url, link_id):
-    session.get(link_url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
+    session.get(link_url, allow_redirects=True, timeout=DEFAULT_API_TIMEOUT)
     token = get_link_token(session, link_id)
     if token:
         return token
     alt_url = f"{base_url}/anyshare/zh-cn/link/{link_id}"
-    session.get(alt_url, allow_redirects=True, timeout=DEFAULT_TIMEOUT)
+    session.get(alt_url, allow_redirects=True, timeout=DEFAULT_API_TIMEOUT)
     token = get_link_token(session, link_id)
     if not token:
         raise AnyshareError("Failed to obtain link token. The link may be invalid or expired.")
@@ -58,7 +60,7 @@ def ensure_link_token(session, link_url, base_url, link_id):
 
 def check_share_info(session, base_url, link_id):
     url = f"{base_url}/api/shared-link/v1/links/{link_id}"
-    resp = session.get(url, timeout=DEFAULT_TIMEOUT)
+    resp = session.get(url, timeout=DEFAULT_API_TIMEOUT)
     if not resp.ok:
         return
     data = resp.json()
@@ -93,7 +95,12 @@ def raise_for_status(resp, action):
 
 
 def api_get_json(session, base_url, token, path, params=None, action="GET"):
-    resp = session.get(api_url(base_url, path), params=params, headers=api_headers(token), timeout=DEFAULT_TIMEOUT)
+    resp = session.get(
+        api_url(base_url, path),
+        params=params,
+        headers=api_headers(token),
+        timeout=DEFAULT_API_TIMEOUT,
+    )
     raise_for_status(resp, action)
     return resp.json()
 
@@ -103,7 +110,7 @@ def api_post_json(session, base_url, token, path, payload, action="POST"):
         api_url(base_url, path),
         json=payload,
         headers=api_headers(token),
-        timeout=DEFAULT_TIMEOUT,
+        timeout=DEFAULT_API_TIMEOUT,
     )
     raise_for_status(resp, action)
     return resp.json()
@@ -181,6 +188,72 @@ def human_size(size):
     return f"{value:.2f} TB"
 
 
+def build_transfer_timeout(seconds):
+    if seconds is None:
+        seconds = DEFAULT_TRANSFER_TIMEOUT
+    if seconds <= 0:
+        return None
+    return (DEFAULT_CONNECT_TIMEOUT, seconds)
+
+
+class ProgressPrinter:
+    def __init__(self, total_bytes, label="Uploading", enabled=True):
+        self.total = total_bytes
+        self.enabled = bool(enabled and total_bytes and sys.stderr.isatty())
+        self.label = label
+        self.start = time.monotonic()
+        self.last_print = 0.0
+        self.transferred = 0
+        self.last_len = 0
+
+    def update(self, delta):
+        if not self.enabled:
+            return
+        self.transferred += delta
+        now = time.monotonic()
+        if now - self.last_print < 0.2 and self.transferred < self.total:
+            return
+        self.last_print = now
+        percent = self.transferred / self.total * 100
+        elapsed = max(now - self.start, 0.001)
+        speed = self.transferred / elapsed
+        message = (
+            f"\r{self.label}: {percent:6.2f}% "
+            f"({human_size(self.transferred)}/{human_size(self.total)}) "
+            f"{human_size(speed)}/s"
+        )
+        pad = max(0, self.last_len - len(message))
+        self.last_len = len(message)
+        sys.stderr.write(message + (" " * pad))
+        sys.stderr.flush()
+
+    def finish(self):
+        if not self.enabled:
+            return
+        self.update(0)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+
+class ProgressFile:
+    def __init__(self, fp, total_bytes, progress):
+        self._fp = fp
+        self._total = total_bytes
+        self._progress = progress
+
+    def read(self, size=-1):
+        data = self._fp.read(size)
+        if data:
+            self._progress.update(len(data))
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._fp, name)
+
+    def __len__(self):
+        return self._total
+
+
 def print_listing(dirs, files):
     if not dirs and not files:
         print("Empty folder.")
@@ -237,8 +310,8 @@ def get_download_url(session, base_url, token, docid, savename, authtype, usehtt
     return method, url
 
 
-def download_file(session, method, url, out_path):
-    resp = session.request(method, url, stream=True, timeout=DEFAULT_TIMEOUT)
+def download_file(session, method, url, out_path, timeout):
+    resp = session.request(method, url, stream=True, timeout=timeout)
     resp.raise_for_status()
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "wb") as f:
@@ -308,7 +381,7 @@ def run_download(args, session, base_url, token, root_docid):
         out_path = os.path.join(out_path, file_item.get("name") or "download")
     if os.path.exists(out_path) and not args.overwrite:
         raise AnyshareError("Output file already exists. Use --overwrite to replace it.")
-    download_file(session, method, url, out_path)
+    download_file(session, method, url, out_path, build_transfer_timeout(args.timeout))
     print(f"Downloaded to: {out_path}")
 
 
@@ -320,9 +393,20 @@ def run_upload(args, session, base_url, token, root_docid):
     data, method, url, fields = begin_upload(
         session, base_url, token, target_docid, args.file, file_name, args.ondup
     )
+    file_size = os.path.getsize(args.file)
+    progress = ProgressPrinter(file_size, enabled=not args.no_progress)
+    content_type = fields.get("Content-Type") or "application/octet-stream"
     with open(args.file, "rb") as f:
-        resp = session.request(method, url, data=fields, files={"file": (file_name, f)}, timeout=DEFAULT_TIMEOUT)
+        wrapped = ProgressFile(f, file_size, progress)
+        resp = session.request(
+            method,
+            url,
+            data=fields,
+            files={"file": (file_name, wrapped, content_type)},
+            timeout=build_transfer_timeout(args.timeout),
+        )
         resp.raise_for_status()
+    progress.finish()
     finish_upload(session, base_url, token, data.get("docid"), data.get("rev"), 0)
     print(f"Upload finished: {file_name}")
 
@@ -342,12 +426,25 @@ def build_parser():
     p_download.add_argument("--out", default="", help="Output file or directory path")
     p_download.add_argument("--overwrite", action="store_true", help="Overwrite output file if exists")
     p_download.add_argument("--authtype", default="1", help="Auth type string for osdownload (default: 1)")
+    p_download.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TRANSFER_TIMEOUT,
+        help="Transfer timeout seconds (default: 3600, 0 to disable)",
+    )
 
     p_upload = sub.add_parser("upload", help="Upload a local file to the share")
     p_upload.add_argument("--file", required=True, help="Local file path")
     p_upload.add_argument("--path", default="", help="Remote subfolder path, like sub/dir")
     p_upload.add_argument("--name", default="", help="Remote file name override")
     p_upload.add_argument("--ondup", type=int, default=1, help="Duplicate policy (default: 1)")
+    p_upload.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TRANSFER_TIMEOUT,
+        help="Transfer timeout seconds (default: 3600, 0 to disable)",
+    )
+    p_upload.add_argument("--no-progress", action="store_true", help="Disable upload progress display")
 
     return parser
 
