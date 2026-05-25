@@ -451,27 +451,66 @@ def run_upload(args, session, base_url, token, root_docid):
     file_size = os.path.getsize(args.file)
     progress = ProgressPrinter(file_size, enabled=not args.no_progress)
     content_type = fields.get("Content-Type") or "application/octet-stream"
-    boundary = f"----anysharecli{int(time.time() * 1000)}"
-    headers = {
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Content-Length": str(
-            _multipart_content_length(fields, boundary, "file", file_name, content_type, file_size)
-        ),
-    }
-    body = _iter_multipart(fields, "file", args.file, file_name, content_type, boundary, progress)
-    try:
-        resp = session.request(
-            method,
-            url,
-            data=body,
-            headers=headers,
-            timeout=build_transfer_timeout(args.timeout),
-        )
-        resp.raise_for_status()
-    except KeyboardInterrupt:
-        progress.abort()
-        raise AnyshareError("Upload interrupted by user.")
-    progress.finish()
+    method_upper = (method or "POST").upper()
+    if method_upper == "PUT":
+        headers = dict(fields)
+        headers.setdefault("Content-Type", content_type)
+        headers["Content-Length"] = str(file_size)
+        try:
+            with open(args.file, "rb") as f:
+                wrapped = ProgressFile(f, file_size, progress)
+                resp = session.request(
+                    method_upper,
+                    url,
+                    data=wrapped,
+                    headers=headers,
+                    timeout=build_transfer_timeout(args.timeout),
+                )
+        except KeyboardInterrupt:
+            progress.abort()
+            raise AnyshareError("Upload interrupted by user.")
+        except requests.RequestException:
+            progress.abort()
+            raise
+        if not resp.ok:
+            progress.abort()
+            detail = (resp.text or "").strip()
+            if detail:
+                raise AnyshareError(f"Upload failed: HTTP {resp.status_code} {detail}")
+            raise AnyshareError(f"Upload failed: HTTP {resp.status_code}")
+        progress.finish()
+    elif method_upper == "POST":
+        boundary = f"----anysharecli{int(time.time() * 1000)}"
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(
+                _multipart_content_length(fields, boundary, "file", file_name, content_type, file_size)
+            ),
+        }
+        body = _iter_multipart(fields, "file", args.file, file_name, content_type, boundary, progress)
+        try:
+            resp = session.request(
+                method_upper,
+                url,
+                data=body,
+                headers=headers,
+                timeout=build_transfer_timeout(args.timeout),
+            )
+        except KeyboardInterrupt:
+            progress.abort()
+            raise AnyshareError("Upload interrupted by user.")
+        except requests.RequestException:
+            progress.abort()
+            raise
+        if not resp.ok:
+            progress.abort()
+            detail = (resp.text or "").strip()
+            if detail:
+                raise AnyshareError(f"Upload failed: HTTP {resp.status_code} {detail}")
+            raise AnyshareError(f"Upload failed: HTTP {resp.status_code}")
+        progress.finish()
+    else:
+        raise AnyshareError(f"Unsupported upload method: {method_upper}")
     finish_upload(session, base_url, token, data.get("docid"), data.get("rev"), 0)
     print(f"Upload finished: {file_name}")
 
