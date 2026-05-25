@@ -309,6 +309,81 @@ def _iter_multipart(fields, file_field, file_path, file_name, content_type, boun
     yield f"--{boundary}--\r\n".encode("utf-8")
 
 
+class _IterableReader:
+    def __init__(self, iterator, total_length, read_size=1024 * 1024):
+        self._iterator = iterator
+        self._total_length = total_length
+        self._read_size = read_size
+        self._buffer = b""
+        self._eof = False
+
+    def __len__(self):
+        return self._total_length
+
+    def read(self, size=-1):
+        if self._eof:
+            return b""
+        if size is None or size < 0:
+            size = self._read_size
+        if size == 0:
+            return b""
+        while len(self._buffer) < size and not self._eof:
+            try:
+                self._buffer += next(self._iterator)
+            except StopIteration:
+                self._eof = True
+        if not self._buffer:
+            return b""
+        if size >= len(self._buffer):
+            data = self._buffer
+            self._buffer = b""
+            return data
+        data = self._buffer[:size]
+        self._buffer = self._buffer[size:]
+        return data
+
+    def close(self):
+        close_method = getattr(self._iterator, "close", None)
+        if close_method:
+            close_method()
+
+
+def _parse_authrequest(method, authrequest):
+    headers = {}
+    form_fields = {}
+    if not isinstance(authrequest, list):
+        return headers, form_fields
+    method_upper = (method or "").upper()
+    for entry in authrequest[2:]:
+        if not isinstance(entry, str):
+            continue
+        entry_key = None
+        sep = None
+        if ": " in entry:
+            sep = ": "
+        else:
+            eq_index = entry.find("=")
+            colon_index = entry.find(":")
+            if eq_index != -1 and (colon_index == -1 or eq_index < colon_index):
+                sep = "="
+            elif colon_index != -1:
+                sep = ":"
+        if not sep:
+            continue
+        entry_key, value = entry.split(sep, 1)
+        key = entry_key.strip()
+        value = (value or "").strip()
+        if not key:
+            continue
+        if sep in (":", ": "):
+            headers[key] = value
+            if method_upper == "POST":
+                form_fields.setdefault(key, value)
+        else:
+            form_fields[key] = value
+    return headers, form_fields
+
+
 def print_listing(dirs, files):
     if not dirs and not files:
         print("Empty folder.")
@@ -391,12 +466,8 @@ def begin_upload(session, base_url, token, folder_docid, file_path, file_name, o
         raise AnyshareError("Unexpected upload authrequest format.")
     method = authrequest[0]
     url = authrequest[1]
-    fields = {}
-    for entry in authrequest[2:]:
-        if ": " in entry:
-            key, value = entry.split(": ", 1)
-            fields[key] = value
-    return data, method, url, fields
+    headers, form_fields = _parse_authrequest(method, authrequest)
+    return data, method, url, headers, form_fields
 
 
 def finish_upload(session, base_url, token, docid, rev, csflevel):
@@ -445,15 +516,21 @@ def run_upload(args, session, base_url, token, root_docid):
         raise AnyshareError(f"Local file not found: {args.file}")
     target_docid = resolve_remote_path(session, base_url, token, root_docid, args.path)
     file_name = args.name or os.path.basename(args.file)
-    data, method, url, fields = begin_upload(
+    data, method, url, header_fields, form_fields = begin_upload(
         session, base_url, token, target_docid, args.file, file_name, args.ondup
     )
     file_size = os.path.getsize(args.file)
     progress = ProgressPrinter(file_size, enabled=not args.no_progress)
-    content_type = fields.get("Content-Type") or "application/octet-stream"
+    content_type = (
+        header_fields.get("Content-Type")
+        or form_fields.get("Content-Type")
+        or "application/octet-stream"
+    )
     method_upper = (method or "POST").upper()
     if method_upper == "PUT":
-        headers = dict(fields)
+        headers = dict(header_fields)
+        if not headers and form_fields:
+            headers = dict(form_fields)
         headers.setdefault("Content-Type", content_type)
         headers["Content-Length"] = str(file_size)
         try:
@@ -480,14 +557,17 @@ def run_upload(args, session, base_url, token, root_docid):
             raise AnyshareError(f"Upload failed: HTTP {resp.status_code}")
         progress.finish()
     elif method_upper == "POST":
+        fields = form_fields or header_fields
         boundary = f"----anysharecli{int(time.time() * 1000)}"
+        content_length = _multipart_content_length(
+            fields, boundary, "file", file_name, content_type, file_size
+        )
         headers = {
             "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Content-Length": str(
-                _multipart_content_length(fields, boundary, "file", file_name, content_type, file_size)
-            ),
+            "Content-Length": str(content_length),
         }
-        body = _iter_multipart(fields, "file", args.file, file_name, content_type, boundary, progress)
+        body_iter = _iter_multipart(fields, "file", args.file, file_name, content_type, boundary, progress)
+        body = _IterableReader(body_iter, content_length)
         try:
             resp = session.request(
                 method_upper,
@@ -502,6 +582,8 @@ def run_upload(args, session, base_url, token, root_docid):
         except requests.RequestException:
             progress.abort()
             raise
+        finally:
+            body.close()
         if not resp.ok:
             progress.abort()
             detail = (resp.text or "").strip()
