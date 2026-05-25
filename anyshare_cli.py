@@ -234,6 +234,12 @@ class ProgressPrinter:
         sys.stderr.write("\n")
         sys.stderr.flush()
 
+    def abort(self):
+        if not self.enabled:
+            return
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
 
 class ProgressFile:
     def __init__(self, fp, total_bytes, progress):
@@ -252,6 +258,55 @@ class ProgressFile:
 
     def __len__(self):
         return self._total
+
+
+def _escape_multipart_value(value):
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _multipart_field_bytes(boundary, name, value):
+    header = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"{_escape_multipart_value(name)}\"\r\n\r\n"
+        f"{value}\r\n"
+    )
+    return header.encode("utf-8")
+
+
+def _multipart_file_header_bytes(boundary, field_name, file_name, content_type):
+    header = (
+        f"--{boundary}\r\n"
+        f"Content-Disposition: form-data; name=\"{_escape_multipart_value(field_name)}\"; "
+        f"filename=\"{_escape_multipart_value(file_name)}\"\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
+    )
+    return header.encode("utf-8")
+
+
+def _multipart_content_length(fields, boundary, file_field, file_name, content_type, file_size):
+    length = 0
+    for name, value in fields.items():
+        length += len(_multipart_field_bytes(boundary, name, value))
+    length += len(_multipart_file_header_bytes(boundary, file_field, file_name, content_type))
+    length += file_size
+    length += len(b"\r\n")
+    length += len(f"--{boundary}--\r\n".encode("utf-8"))
+    return length
+
+
+def _iter_multipart(fields, file_field, file_path, file_name, content_type, boundary, progress, chunk_size=1024 * 1024):
+    for name, value in fields.items():
+        yield _multipart_field_bytes(boundary, name, value)
+    yield _multipart_file_header_bytes(boundary, file_field, file_name, content_type)
+    with open(file_path, "rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            progress.update(len(chunk))
+            yield chunk
+    yield b"\r\n"
+    yield f"--{boundary}--\r\n".encode("utf-8")
 
 
 def print_listing(dirs, files):
@@ -396,16 +451,26 @@ def run_upload(args, session, base_url, token, root_docid):
     file_size = os.path.getsize(args.file)
     progress = ProgressPrinter(file_size, enabled=not args.no_progress)
     content_type = fields.get("Content-Type") or "application/octet-stream"
-    with open(args.file, "rb") as f:
-        wrapped = ProgressFile(f, file_size, progress)
+    boundary = f"----anysharecli{int(time.time() * 1000)}"
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Content-Length": str(
+            _multipart_content_length(fields, boundary, "file", file_name, content_type, file_size)
+        ),
+    }
+    body = _iter_multipart(fields, "file", args.file, file_name, content_type, boundary, progress)
+    try:
         resp = session.request(
             method,
             url,
-            data=fields,
-            files={"file": (file_name, wrapped, content_type)},
+            data=body,
+            headers=headers,
             timeout=build_transfer_timeout(args.timeout),
         )
         resp.raise_for_status()
+    except KeyboardInterrupt:
+        progress.abort()
+        raise AnyshareError("Upload interrupted by user.")
     progress.finish()
     finish_upload(session, base_url, token, data.get("docid"), data.get("rev"), 0)
     print(f"Upload finished: {file_name}")
